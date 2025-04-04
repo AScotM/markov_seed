@@ -1,6 +1,7 @@
 import random
 import logging
 from collections import defaultdict
+from typing import List
 
 # Configure logging
 logging.basicConfig(
@@ -10,15 +11,26 @@ logging.basicConfig(
 )
 
 class MarkovSeedGenerator:
-    def __init__(self, n=3, verbose=False):
+    def __init__(self, n: int = 3, verbose: bool = False):
+        """
+        Initialize the MarkovSeedGenerator.
+
+        :param n: Character-level n-gram size (must be a positive integer)
+        :param verbose: Enable verbose mode for detailed output (default: False)
+        """
         if not isinstance(n, int) or n <= 0:
             raise ValueError("n must be a positive integer.")
         self.n = n  # Character-level n-gram size
         self.model = defaultdict(list)
         self.verbose = verbose  # Enable verbose mode
 
-    def train(self, text):
-        """Train the Markov model on character sequences."""
+    def train(self, text: str) -> None:
+        """
+        Train the Markov model on character sequences.
+
+        :param text: Training text for the Markov model
+        :raises ValueError: If the input text is empty or too short for the given n-gram size
+        """
         if not text:
             logging.error("Training failed: Input text is empty.")
             raise ValueError("Training text cannot be empty.")
@@ -36,8 +48,14 @@ class MarkovSeedGenerator:
             print(f"Training completed! Model size: {len(self.model)} keys.")
         logging.info(f"Model trained with {len(self.model)} keys.")
 
-    def generate(self, length=12):
-        """Generate a seed using the trained Markov model."""
+    def generate(self, length: int = 12) -> str:
+        """
+        Generate a seed using the trained Markov model.
+
+        :param length: Desired length of the generated seed (default: 12)
+        :return: Generated seed as a string
+        :raises RuntimeError: If the model is empty (not trained)
+        """
         if not self.model:
             logging.error("Seed generation failed: Model is empty.")
             raise RuntimeError("Train the model before generating seeds.")
@@ -63,8 +81,10 @@ class MarkovSeedGenerator:
         logging.info(f"Generated seed: {generated_seed}")
         return generated_seed
 
-    def reset_model(self):
-        """Reset the Markov model."""
+    def reset_model(self) -> None:
+        """
+        Reset the Markov model.
+        """
         self.model.clear()
         logging.info("Model reset.")
 
