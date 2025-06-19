@@ -1,28 +1,41 @@
 import random
 import logging
 from collections import defaultdict
-from typing import List
-
-# Configure logging
-logging.basicConfig(
-    filename="seed_generator.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+from typing import List, Optional
 
 class MarkovSeedGenerator:
-    def __init__(self, n: int = 3, verbose: bool = False):
+    """
+    MarkovSeedGenerator generates pseudo-random seeds based on character-level n-grams.
+    Note: This generator is NOT cryptographically secure.
+    """
+    def __init__(self, n: int = 3, verbose: bool = False, random_seed: Optional[int]=None, log_to_file: bool = True):
         """
         Initialize the MarkovSeedGenerator.
 
         :param n: Character-level n-gram size (must be a positive integer)
         :param verbose: Enable verbose mode for detailed output (default: False)
+        :param random_seed: If set, initializes random number generator for reproducibility.
+        :param log_to_file: If True, logs to a file; otherwise logs to stdout.
         """
         if not isinstance(n, int) or n <= 0:
             raise ValueError("n must be a positive integer.")
-        self.n = n  # Character-level n-gram size
-        self.model = defaultdict(list)
-        self.verbose = verbose  # Enable verbose mode
+        self.n = n
+        self.model: defaultdict[str, List[str]] = defaultdict(list)
+        self.verbose = verbose
+
+        if random_seed is not None:
+            random.seed(random_seed)
+        if log_to_file:
+            logging.basicConfig(
+                filename="seed_generator.log",
+                level=logging.INFO,
+                format="%(asctime)s - %(levelname)s - %(message)s"
+            )
+        else:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s - %(levelname)s - %(message)s"
+            )
 
     def train(self, text: str) -> None:
         """
@@ -40,9 +53,9 @@ class MarkovSeedGenerator:
 
         text = text.lower().replace("\n", " ")  # Normalize text
         for i in range(len(text) - self.n):
-            key = text[i:i + self.n]  # n-gram key
-            next_char = text[i + self.n]  # Next character
-            self.model[key].append(next_char)  # Store transition
+            key = text[i:i + self.n]
+            next_char = text[i + self.n]
+            self.model[key].append(next_char)
 
         if self.verbose:
             print(f"Training completed! Model size: {len(self.model)} keys.")
@@ -60,24 +73,28 @@ class MarkovSeedGenerator:
             logging.error("Seed generation failed: Model is empty.")
             raise RuntimeError("Train the model before generating seeds.")
 
-        seed = random.choice(list(self.model.keys()))  # Random starting key
+        seed = random.choice(list(self.model.keys()))
         output = list(seed)
 
         if self.verbose:
             print(f"Starting seed: {seed}")
 
         for _ in range(length - self.n):
-            if seed in self.model:
-                next_char = random.choice(self.model[seed])  # Choose next character
+            if seed in self.model and self.model[seed]:
+                next_char = random.choice(self.model[seed])
                 output.append(next_char)
-                seed = seed[1:] + next_char  # Shift n-gram window
+                seed = seed[1:] + next_char
                 if self.verbose:
                     print(f"Next char: {next_char}, New seed: {seed}")
             else:
                 logging.warning(f"Unexpected stop: No transitions available for key '{seed}'.")
-                break
+                # Optionally, restart with a random key to fill out to length
+                if self.model:
+                    seed = random.choice(list(self.model.keys()))
+                else:
+                    break
 
-        generated_seed = ''.join(output)
+        generated_seed = ''.join(output)[:length]
         logging.info(f"Generated seed: {generated_seed}")
         return generated_seed
 
@@ -88,12 +105,11 @@ class MarkovSeedGenerator:
         self.model.clear()
         logging.info("Model reset.")
 
-# Example Usage
 if __name__ == "__main__":
     training_text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()"
 
-    markov_seeds = MarkovSeedGenerator(n=3, verbose=True)
-    
+    # Example with reproducibility and log to stdout
+    markov_seeds = MarkovSeedGenerator(n=3, verbose=True, random_seed=42, log_to_file=False)
     try:
         markov_seeds.train(training_text)
         for _ in range(5):
