@@ -6,41 +6,41 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // MarkovSeedGenerator struct
 type MarkovSeedGenerator struct {
-	N      int
-	Model  map[string][]string
+	N       int
+	Model   map[string][]string
 	Verbose bool
 }
 
 // NewMarkovSeedGenerator initializes a new generator
-func NewMarkovSeedGenerator(n int, verbose bool) *MarkovSeedGenerator {
+func NewMarkovSeedGenerator(n int, verbose bool) (*MarkovSeedGenerator, error) {
 	if n <= 0 {
-		log.Fatal("n must be a positive integer.")
+		return nil, fmt.Errorf("n must be a positive integer")
 	}
 	return &MarkovSeedGenerator{
-		N:      n,
-		Model:  make(map[string][]string),
+		N:       n,
+		Model:   make(map[string][]string),
 		Verbose: verbose,
-	}
+	}, nil
 }
 
 // Train builds the Markov model from input text
-func (m *MarkovSeedGenerator) Train(text string) {
-	text = strings.ToLower(strings.ReplaceAll(text, "\n", " "))
-	text = strings.TrimSpace(text)
+func (m *MarkovSeedGenerator) Train(text string) error {
+	runes := []rune(text)
+	textLen := len(runes)
 
-	if len(text) <= m.N {
-		log.Fatal("Training failed: Input text is too short for the given n-gram size.")
+	if textLen <= m.N {
+		return fmt.Errorf("training failed: input text is too short for the given n-gram size")
 	}
 
-	for i := 0; i < len(text)-m.N; i++ {
-		key := text[i : i+m.N]
-		nextChar := string(text[i+m.N])
+	for i := 0; i < textLen-m.N; i++ {
+		key := string(runes[i : i+m.N])
+		nextChar := string(runes[i+m.N])
 		m.Model[key] = append(m.Model[key], nextChar)
 	}
 
@@ -51,17 +51,18 @@ func (m *MarkovSeedGenerator) Train(text string) {
 	if m.Verbose {
 		fmt.Printf("Training completed! Model size: %d keys.\n", len(m.Model))
 	}
+	return nil
 }
 
 // Generate creates a random sequence based on the trained model
-func (m *MarkovSeedGenerator) Generate(length int) string {
+func (m *MarkovSeedGenerator) Generate(length int) (string, error) {
 	if len(m.Model) == 0 {
-		log.Fatal("Model is empty. Train the model before generating seeds.")
+		return "", fmt.Errorf("model is empty. Train the model before generating seeds")
+	}
+	if length < m.N {
+		return "", fmt.Errorf("desired length must be at least n (%d)", m.N)
 	}
 
-	rand.Seed(time.Now().UnixNano())
-
-	// Get random starting key
 	keys := make([]string, 0, len(m.Model))
 	for k := range m.Model {
 		keys = append(keys, k)
@@ -74,19 +75,25 @@ func (m *MarkovSeedGenerator) Generate(length int) string {
 	}
 
 	for i := 0; i < length-m.N; i++ {
-		if nextChars, exists := m.Model[seed]; exists {
+		nextChars, exists := m.Model[seed]
+		if exists {
 			nextChar := nextChars[rand.Intn(len(nextChars))]
-			output = append(output, rune(nextChar[0]))
-			seed = seed[1:] + nextChar
+			nextRune, _ := utf8.DecodeRuneInString(nextChar)
+			output = append(output, nextRune)
+			seedRunes := []rune(seed)
+			seedRunes = append(seedRunes[1:], nextRune)
+			seed = string(seedRunes)
 		} else {
 			log.Println("Warning: No transitions available for key, restarting...")
 			seed = keys[rand.Intn(len(keys))] // Restart with another key
+			// Reset output to seed to preserve length
+			output = []rune(seed)
 		}
 	}
 
 	generatedSeed := string(output)
 	log.Println("Generated seed:", generatedSeed)
-	return generatedSeed
+	return generatedSeed, nil
 }
 
 // SaveModel saves the Markov model to a file
@@ -128,13 +135,19 @@ func LoadModel(filename string) (*MarkovSeedGenerator, error) {
 
 // Main function for example usage
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	trainingText := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()"
 
-	markov := NewMarkovSeedGenerator(3, true)
-	markov.Train(trainingText)
-
-	err := markov.SaveModel("markov_model.gob")
+	markov, err := NewMarkovSeedGenerator(3, true)
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := markov.Train(trainingText); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := markov.SaveModel("markov_model.gob"); err != nil {
 		log.Fatal("Error saving model:", err)
 	}
 
@@ -144,6 +157,10 @@ func main() {
 	}
 
 	for i := 0; i < 5; i++ {
-		fmt.Println("Generated Seed:", loadedMarkov.Generate(12))
+		seed, err := loadedMarkov.Generate(12)
+		if err != nil {
+			log.Fatal("Error generating seed:", err)
+		}
+		fmt.Println("Generated Seed:", seed)
 	}
 }
