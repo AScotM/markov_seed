@@ -3,16 +3,31 @@ package main
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"os"
+	"strings"
+	"unicode/utf8"
 )
 
 type MarkovSeedGenerator struct {
-	N       int
-	Model   map[string][]rune
-	Text    string
-	Verbose bool
+	N           int
+	Model       map[string][]rune
+	Text        string
+	Verbose     bool
+	logMessages []string
+}
+
+type ModelStats struct {
+	NGrams          int
+	TotalTransitions int
+	AvgTransitions   float64
+	MaxTransitions   int
+	MinTransitions   int
+	DeadEnds        int
 }
 
 func NewMarkovSeedGenerator(n int, verbose bool) (*MarkovSeedGenerator, error) {
@@ -20,9 +35,10 @@ func NewMarkovSeedGenerator(n int, verbose bool) (*MarkovSeedGenerator, error) {
 		return nil, fmt.Errorf("n must be positive")
 	}
 	return &MarkovSeedGenerator{
-		N:       n,
-		Model:   make(map[string][]rune),
-		Verbose: verbose,
+		N:           n,
+		Model:       make(map[string][]rune),
+		Verbose:     verbose,
+		logMessages: make([]string, 0),
 	}, nil
 }
 
@@ -32,17 +48,43 @@ func secureRandIntn(n int) int {
 	}
 	num, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
 	if err != nil {
-		var fallback uint32
-		binary.Read(rand.Reader, binary.BigEndian, &fallback)
-		return int(fallback) % n
+		// More robust fallback
+		var fallback int64
+		if err := binary.Read(rand.Reader, binary.BigEndian, &fallback); err != nil {
+			// Ultimate fallback - not crypto secure but better than crashing
+			return int(big.NewInt(0).Mod(big.NewInt(int64(os.Getpid())^int64(n)), big.NewInt(int64(n))).Int64())
+		}
+		if fallback < 0 {
+			fallback = -fallback
+		}
+		return int(fallback % int64(n))
 	}
 	return int(num.Int64())
 }
 
+func (m *MarkovSeedGenerator) log(format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+	if m.Verbose {
+		m.logMessages = append(m.logMessages, message)
+		log.Println(message)
+	}
+}
+
+func (m *MarkovSeedGenerator) GetLogs() []string {
+	return m.logMessages
+}
+
+func (m *MarkovSeedGenerator) ClearLogs() {
+	m.logMessages = m.logMessages[:0]
+}
+
 func (m *MarkovSeedGenerator) Train(text string) error {
+	// Sanitize input - remove control characters
+	text = sanitizeText(text)
+	
 	runes := []rune(text)
 	if len(runes) <= m.N {
-		return fmt.Errorf("text too short")
+		return fmt.Errorf("text length %d must be greater than n %d", len(runes), m.N)
 	}
 
 	m.Text = text
@@ -56,62 +98,270 @@ func (m *MarkovSeedGenerator) Train(text string) error {
 		key := string(runes[i:end])
 		nextChar := runes[end]
 		
-		if m.Model[key] == nil {
-			m.Model[key] = make([]rune, 0, 4)
-		}
 		m.Model[key] = append(m.Model[key], nextChar)
 	}
 
-	if m.Verbose {
-		log.Printf("Trained model with %d n-grams", len(m.Model))
-	}
+	m.log("Trained model with %d n-grams", len(m.Model))
 	return nil
 }
 
-func (m *MarkovSeedGenerator) Generate(length int) (string, error) {
+func (m *MarkovSeedGenerator) TrainFromFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open training file: %w", err)
+	}
+	defer file.Close()
+
+	m.log("Training from file: %s", filename)
+
+	// Get file size for progress reporting
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+	fileSize := info.Size()
+
+	buffer := make([]byte, 8192) // 8KB chunks
+	var textBuilder strings.Builder
+	processedBytes := int64(0)
+
+	for {
+		n, err := file.Read(buffer)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("error reading file: %w", err)
+		}
+
+		if n == 0 {
+			break
+		}
+
+		// Convert to string and sanitize
+		chunk := sanitizeText(string(buffer[:n]))
+		textBuilder.WriteString(chunk)
+		processedBytes += int64(n)
+
+		// Log progress for large files
+		if m.Verbose && fileSize > 0 {
+			percent := float64(processedBytes) / float64(fileSize) * 100
+			m.log("Processed %d/%d bytes (%.1f%%)", processedBytes, fileSize, percent)
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	return m.Train(textBuilder.String())
+}
+
+func sanitizeText(text string) string {
+	// Remove control characters (0x00-0x1F, 0x7F)
+	var result strings.Builder
+	for _, r := range text {
+		if r >= 32 && r != 127 || r == '\n' || r == '\t' {
+			result.WriteRune(r)
+		}
+	}
+	return result.String()
+}
+
+func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string, error) {
 	if len(m.Model) == 0 {
 		return "", fmt.Errorf("untrained model")
 	}
 	if length < m.N {
-		return "", fmt.Errorf("length too short")
+		return "", fmt.Errorf("length %d must be at least n %d", length, m.N)
 	}
 
+	// Get all possible keys
 	keys := make([]string, 0, len(m.Model))
 	for k := range m.Model {
 		keys = append(keys, k)
 	}
 
-	seed := keys[secureRandIntn(len(keys))]
+	// Determine starting seed
+	var seed string
+	if len(startWith) > 0 && utf8.RuneCountInString(startWith[0]) == m.N {
+		if _, exists := m.Model[startWith[0]]; exists {
+			seed = startWith[0]
+			m.log("Starting generation with: %q", seed)
+		} else {
+			m.log("Warning: Starting n-gram %q not found, using random", startWith[0])
+			seed = keys[secureRandIntn(len(keys))]
+		}
+	} else {
+		seed = keys[secureRandIntn(len(keys))]
+	}
+
 	output := []rune(seed)
 
 	for len(output) < length {
 		nextChars := m.Model[seed]
 		if len(nextChars) == 0 {
-			// Fallback to random character from text
-			runes := []rune(m.Text)
-			if len(runes) == 0 {
-				break
+			// Enhanced fallback: try to find similar n-gram
+			similar := m.findSimilarNgram(seed)
+			if similar != "" {
+				m.log("Fallback: using similar n-gram %q for %q", similar, seed)
+				nextChars = m.Model[similar]
+			} else {
+				// Ultimate fallback: random character from text
+				runes := []rune(m.Text)
+				if len(runes) == 0 {
+					return "", fmt.Errorf("no text available for fallback")
+				}
+				nextChar := runes[secureRandIntn(len(runes))]
+				output = append(output, nextChar)
+				if len(seed) > 0 {
+					seed = string([]rune(seed)[1:]) + string(nextChar)
+				}
+				continue
 			}
-			nextChar := runes[secureRandIntn(len(runes))]
-			output = append(output, nextChar)
-			seed = seed[1:] + string(nextChar)
-			continue
+		}
+
+		if len(nextChars) == 0 {
+			return "", fmt.Errorf("no valid transitions available")
 		}
 
 		nextChar := nextChars[secureRandIntn(len(nextChars))]
 		output = append(output, nextChar)
-		seed = seed[1:] + string(nextChar)
+		
+		// Update seed: remove first character, add new character
+		seedRunes := []rune(seed)
+		seed = string(seedRunes[1:]) + string(nextChar)
 	}
 
-	if len(output) > length {
-		output = output[:length]
+	return string(output[:length]), nil
+}
+
+func (m *MarkovSeedGenerator) findSimilarNgram(target string) string {
+	bestMatch := ""
+	bestDistance := -1
+	targetRunes := []rune(target)
+
+	for key := range m.Model {
+		keyRunes := []rune(key)
+		distance := levenshteinDistance(targetRunes, keyRunes)
+		if bestDistance == -1 || distance < bestDistance {
+			bestDistance = distance
+			bestMatch = key
+		}
+		// Early exit for perfect or near-perfect match
+		if bestDistance <= 1 {
+			break
+		}
 	}
-	return string(output), nil
+
+	return bestMatch
+}
+
+func levenshteinDistance(a, b []rune) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+
+	matrix := make([][]int, len(a)+1)
+	for i := range matrix {
+		matrix[i] = make([]int, len(b)+1)
+		matrix[i][0] = i
+	}
+	for j := range matrix[0] {
+		matrix[0][j] = j
+	}
+
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			matrix[i][j] = min(
+				matrix[i-1][j]+1,      // deletion
+				matrix[i][j-1]+1,      // insertion
+				matrix[i-1][j-1]+cost, // substitution
+			)
+		}
+	}
+
+	return matrix[len(a)][len(b)]
+}
+
+func min(values ...int) int {
+	minVal := values[0]
+	for _, v := range values[1:] {
+		if v < minVal {
+			minVal = v
+		}
+	}
+	return minVal
+}
+
+func (m *MarkovSeedGenerator) ValidateModel() ModelStats {
+	stats := ModelStats{
+		MinTransitions: -1,
+	}
+
+	for _, transitions := range m.Model {
+		count := len(transitions)
+		stats.NGrams++
+		stats.TotalTransitions += count
+
+		if count > stats.MaxTransitions {
+			stats.MaxTransitions = count
+		}
+		if stats.MinTransitions == -1 || count < stats.MinTransitions {
+			stats.MinTransitions = count
+		}
+		if count == 0 {
+			stats.DeadEnds++
+		}
+	}
+
+	if stats.NGrams > 0 {
+		stats.AvgTransitions = float64(stats.TotalTransitions) / float64(stats.NGrams)
+	}
+
+	return stats
+}
+
+func (m *MarkovSeedGenerator) SaveModel(filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create model file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(m.Model); err != nil {
+		return fmt.Errorf("failed to encode model: %w", err)
+	}
+
+	m.log("Model saved to %s", filename)
+	return nil
+}
+
+func (m *MarkovSeedGenerator) LoadModel(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open model file: %w", err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&m.Model); err != nil {
+		return fmt.Errorf("failed to decode model: %w", err)
+	}
+
+	m.log("Model loaded from %s with %d n-grams", filename, len(m.Model))
+	return nil
 }
 
 func main() {
 	// Robust training text with sufficient length
-	const trainingText = `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>/?` + 
+	const trainingText = `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>/?` +
 		`The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.`
 
 	markov, err := NewMarkovSeedGenerator(3, true)
@@ -123,6 +373,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Validate model
+	stats := markov.ValidateModel()
+	fmt.Printf("Model Statistics:\n")
+	fmt.Printf("- N-Grams: %d\n", stats.NGrams)
+	fmt.Printf("- Total Transitions: %d\n", stats.TotalTransitions)
+	fmt.Printf("- Average Transitions: %.2f\n", stats.AvgTransitions)
+	fmt.Printf("- Max Transitions: %d\n", stats.MaxTransitions)
+	fmt.Printf("- Min Transitions: %d\n", stats.MinTransitions)
+	fmt.Printf("- Dead Ends: %d\n", stats.DeadEnds)
+	fmt.Println()
+
+	// Generate samples
 	for i := 0; i < 5; i++ {
 		seed, err := markov.Generate(16)
 		if err != nil {
@@ -131,4 +393,33 @@ func main() {
 		}
 		fmt.Printf("Generated %d: %q\n", i+1, seed)
 	}
+
+	fmt.Println()
+
+	// Generate with specific starting point
+	seeded, err := markov.Generate(20, "The")
+	if err != nil {
+		log.Println("Error:", err)
+	} else {
+		fmt.Printf("Seeded generation: %q\n", seeded)
+	}
+
+	// Save and reload model
+	if err := markov.SaveModel("markov_model.json"); err != nil {
+		log.Println("Error saving model:", err)
+	}
+
+	// Create new instance and load model
+	markov2, err := NewMarkovSeedGenerator(3, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := markov2.LoadModel("markov_model.json"); err != nil {
+		log.Fatal(err)
+	}
+	reloaded, err := markov2.Generate(16)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("From reloaded model: %q\n", reloaded)
 }
