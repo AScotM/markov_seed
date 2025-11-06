@@ -6,6 +6,8 @@ class MarkovSeedGenerator {
         this.n = n;
         this.model = new Map();
         this.verbose = verbose;
+        this.randomBuffer = crypto.randomBytes(256);
+        this.bufferIndex = 0;
     }
 
     train(text) {
@@ -14,13 +16,15 @@ class MarkovSeedGenerator {
         }
 
         this.text = text;
+        this.keys = [];
 
         for (let i = 0; i <= text.length - this.n - 1; i++) {
-            const key = text.substr(i, this.n);
-            const nextChar = text.substr(i + this.n, 1);
+            const key = text.substring(i, i + this.n);
+            const nextChar = text.substring(i + this.n, i + this.n + 1);
 
             if (!this.model.has(key)) {
                 this.model.set(key, []);
+                this.keys.push(key);
             }
             this.model.get(key).push(nextChar);
         }
@@ -34,18 +38,16 @@ class MarkovSeedGenerator {
         if (this.model.size === 0) throw new Error("Untrained model");
         if (length < this.n) throw new Error("Length too short");
 
-        const keys = Array.from(this.model.keys());
-        let seed = keys[this.secureRandInt(keys.length)];
+        let seed = this.keys[this.secureRandInt(this.keys.length)];
         let output = seed;
 
         while (output.length < length) {
-            const lastN = output.substr(-this.n);
+            const lastN = output.substring(output.length - this.n);
             const possibleNext = this.model.get(lastN);
 
             if (!possibleNext || possibleNext.length === 0) {
-                // Fallback to random character from text
-                const fallback = this.text.charAt(this.secureRandInt(this.text.length));
-                output += fallback;
+                const newStart = this.keys[this.secureRandInt(this.keys.length)];
+                output += newStart;
                 continue;
             }
 
@@ -53,18 +55,23 @@ class MarkovSeedGenerator {
             output += nextChar;
         }
 
-        return output.substr(0, length);
+        return output.substring(0, length);
     }
 
     secureRandInt(max) {
         if (max <= 0) return 0;
-        const randomBytes = crypto.randomBytes(4);
-        const randomInt = randomBytes.readUInt32BE(0);
+        
+        if (this.bufferIndex >= this.randomBuffer.length - 4) {
+            this.randomBuffer = crypto.randomBytes(256);
+            this.bufferIndex = 0;
+        }
+        
+        const randomInt = this.randomBuffer.readUInt32BE(this.bufferIndex);
+        this.bufferIndex += 4;
         return randomInt % max;
     }
 }
 
-// Example usage
 const trainingText = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>/? " +
     "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.";
 
